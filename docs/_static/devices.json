@@ -95,6 +95,24 @@
     "oem": "https://www.agilent.com/en/product/cell-analysis/cell-imaging-microscopy/cell-imaging-multimode-readers/biotek-cytation-5-cell-imaging-multimode-reader-1623202"
   },
   {
+    "id": "biotek-cytation-7",
+    "vendor": "Agilent (BioTek)",
+    "name": "Cytation 7",
+    "kind": "plate reader",
+    "capabilities": [
+      "absorbance",
+      "fluorescence",
+      "luminescence",
+      "shaking"
+    ],
+    "status": "wip",
+    "api": "pylabrobot.agilent.biotek.cytation.Cytation7",
+    "api_version": "v1",
+    "code_slug": "agilent/biotek/cytation/cytation7",
+    "doc_slug": "agilent/cytation7/hello-world",
+    "notes": "Shared reader API; C7 hardware verification pending. No microscopy or temperature setting."
+  },
+  {
     "id": "biotek-el405",
     "vendor": "Agilent (BioTek)",
     "name": "EL405",

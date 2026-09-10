@@ -1,16 +1,14 @@
 # mypy: disable-error-code = attr-defined
 
 
+import asyncio
 import math
 import unittest
 import unittest.mock
 from datetime import datetime
 from typing import Iterator
 
-import pytest
-
-pytest.importorskip("pylibftdi")
-
+from pylabrobot.agilent.biotek.cytation import Cytation7
 from pylabrobot.agilent.biotek.plate_reader_base import BioTekPlateReaderDriver
 from pylabrobot.resources import CellVis_24_wellplate_3600uL_Fb, CellVis_96_wellplate_350uL_Fb
 
@@ -21,23 +19,28 @@ def _byte_iter(s: str) -> Iterator[bytes]:
 
 
 class TestCytation5Backend(unittest.IsolatedAsyncioTestCase):
-  """Tests for the Cytation5Backend."""
+  """Shared BioTek reader fixtures; these are not C7 hardware captures."""
+
+  def create_backend(self) -> BioTekPlateReaderDriver:
+    """Construct the shared reader under the transport mock installed by setup."""
+    return BioTekPlateReaderDriver()
 
   async def asyncSetUp(self):
-    self.backend = BioTekPlateReaderDriver()
-    self.backend.io = unittest.mock.MagicMock()
-    self.backend.io.setup = unittest.mock.AsyncMock()
-    self.backend.io.stop = unittest.mock.AsyncMock()
-    self.backend.io.read = unittest.mock.AsyncMock()
-    self.backend.io.write = unittest.mock.AsyncMock()
-    self.backend.io.usb_reset = unittest.mock.AsyncMock()
-    self.backend.io.usb_purge_rx_buffer = unittest.mock.AsyncMock()
-    self.backend.io.usb_purge_tx_buffer = unittest.mock.AsyncMock()
-    self.backend.io.set_latency_timer = unittest.mock.AsyncMock()
-    self.backend.io.set_baudrate = unittest.mock.AsyncMock()
-    self.backend.io.set_line_property = unittest.mock.AsyncMock()
-    self.backend.io.set_flowctrl = unittest.mock.AsyncMock()
-    self.backend.io.set_rts = unittest.mock.AsyncMock()
+    with unittest.mock.patch("pylabrobot.agilent.biotek.plate_reader_base.FTDI") as self.ftdi:
+      self.backend = self.create_backend()
+    self.io = self.ftdi.return_value
+    self.io.setup = unittest.mock.AsyncMock()
+    self.io.stop = unittest.mock.AsyncMock()
+    self.io.read = unittest.mock.AsyncMock()
+    self.io.write = unittest.mock.AsyncMock()
+    self.io.usb_reset = unittest.mock.AsyncMock()
+    self.io.usb_purge_rx_buffer = unittest.mock.AsyncMock()
+    self.io.usb_purge_tx_buffer = unittest.mock.AsyncMock()
+    self.io.set_latency_timer = unittest.mock.AsyncMock()
+    self.io.set_baudrate = unittest.mock.AsyncMock()
+    self.io.set_line_property = unittest.mock.AsyncMock()
+    self.io.set_flowctrl = unittest.mock.AsyncMock()
+    self.io.set_rts = unittest.mock.AsyncMock()
     self.plate = CellVis_24_wellplate_3600uL_Fb(name="plate")
 
     # Freeze the clock so the timestamp in the results is predictable.
@@ -48,6 +51,112 @@ class TestCytation5Backend(unittest.IsolatedAsyncioTestCase):
     )
     self._time_patcher.start()
     self.addCleanup(self._time_patcher.stop)
+
+  async def test_setup_baud_rate_fallback(self) -> None:
+    """A firmware-query timeout retries at the existing alternate baud rate."""
+    self.backend.io.read.side_effect = [
+      TimeoutError("Synthetic initial firmware timeout"),
+      *_byte_iter("\x061650200  Version 1.04   0000\x03"),
+    ]
+    await self.backend.setup()
+    self.assertEqual(
+      self.backend.io.set_baudrate.await_args_list,
+      [unittest.mock.call(9600), unittest.mock.call(38_461)],
+    )
+    self.assertEqual(self.backend.version, "1.04")
+    self.assertEqual(self.backend.io.write.await_args_list, [unittest.mock.call(b"e")] * 2)
+    await self.backend.stop()
+
+  async def test_setup_propagates_firmware_timeout(self) -> None:
+    """Both failed firmware attempts propagate the timeout to the caller."""
+    self.backend.io.read.side_effect = TimeoutError("Synthetic firmware timeout")
+    with self.assertRaises(TimeoutError):
+      await self.backend.setup()
+    self.assertEqual(self.backend.io.write.await_args_list, [unittest.mock.call(b"e")] * 2)
+
+  async def test_temperature_query_timeout(self) -> None:
+    """An unterminated reply times out without retrying the command."""
+    self.backend.io.read.return_value = b"\x06"
+    with unittest.mock.patch(
+      "pylabrobot.agilent.biotek.plate_reader_base.time.time", side_effect=[0, 2]
+    ):
+      with self.assertRaises(TimeoutError):
+        await self.backend.request_current_temperature()
+    self.backend.io.write.assert_awaited_once_with(b"h")
+
+  async def test_temperature_setting_disabled(self) -> None:
+    """The inherited temperature setting rejects requests before any I/O."""
+    self.assertFalse(self.backend.supports_heating)
+    self.assertFalse(self.backend.supports_cooling)
+    self.assertFalse(self.backend.supports_active_cooling)
+    with self.assertRaises(NotImplementedError):
+      await self.backend.set_temperature(37)
+    self.backend.io.write.assert_not_called()
+
+  async def test_deactivate(self) -> None:
+    """Deactivation retains the existing temperature-off command."""
+    self.backend.io.read.side_effect = _byte_iter("\x06\x03")
+    await self.backend.deactivate()
+    self.assertEqual(
+      self.backend.io.write.await_args_list,
+      [unittest.mock.call(b"g"), unittest.mock.call(b"00000")],
+    )
+
+  async def test_home(self) -> None:
+    """Homing retains the existing parameterized command sequence."""
+    self.backend.io.read.side_effect = _byte_iter("\x06\x03")
+    await self.backend.home()
+    self.assertEqual(
+      self.backend.io.write.await_args_list,
+      [unittest.mock.call(b"i"), unittest.mock.call(b"x")],
+    )
+
+  async def test_shake_modes_and_stop(self) -> None:
+    """Synthetic replies exercise both existing shake packets and task cancellation."""
+    self.backend.io.read.side_effect = _byte_iter("\x061650200  Version 1.04   0000\x03")
+    await self.backend.setup()
+    self.addAsyncCleanup(self.backend.stop)
+    for mode, packet in (
+      (self.backend.ShakeType.LINEAR, b"0033010101010100002000000013960030189\x03"),
+      (self.backend.ShakeType.ORBITAL, b"0033010101010100002000000013960130190\x03"),
+    ):
+      with self.subTest(mode=mode):
+        self.backend.io.write.reset_mock()
+        self.backend.io.read.side_effect = _byte_iter("\x06\x03\x060000\x03")
+        try:
+          await asyncio.wait_for(self.backend.shake(mode, frequency=3), timeout=1)
+        finally:
+          await self.backend.stop_shaking()
+        self.assertFalse(self.backend._shaking)
+        self.assertIsNone(self.backend._shaking_task)
+        await self.backend.stop_shaking()
+        self.assertEqual(
+          self.backend.io.write.await_args_list,
+          [
+            unittest.mock.call(b"D"),
+            unittest.mock.call(packet),
+            unittest.mock.call(b"O"),
+            unittest.mock.call(b"x"),
+          ],
+        )
+
+  async def test_acquisition_body_timeout(self) -> None:
+    """Execution acknowledgement is not completion; a missing body is not retried."""
+    self.backend.io.read.side_effect = [
+      *_byte_iter("\x06\x03\x06\x03\x060000\x03"),
+      TimeoutError("Synthetic acquisition body timeout"),
+    ]
+    with self.assertRaises(TimeoutError):
+      await self.backend.read_absorbance(plate=self.plate, wells=self.plate["A1"], wavelength=600)
+    self.assertEqual(self.backend.io.write.await_args_list.count(unittest.mock.call(b"O")), 1)
+    self.assertEqual(self.backend.io.write.await_args_list[-1], unittest.mock.call(b"O"))
+
+  async def test_unexpected_execution_reply(self) -> None:
+    """Unexpected execution status retains the shared driver's rejection behavior."""
+    self.backend.io.read.side_effect = _byte_iter("\x06\x03\x06\x03\x150001\x03")
+    with self.assertRaises(AssertionError):
+      await self.backend.read_absorbance(plate=self.plate, wells=self.plate["A1"], wavelength=600)
+    self.assertEqual(self.backend.io.write.await_args_list[-1], unittest.mock.call(b"O"))
 
   async def test_setup(self):
     self.backend.io.read.side_effect = _byte_iter("\x061650200  Version 1.04   0000\x03")
@@ -402,12 +511,50 @@ class TestCytation5Backend(unittest.IsolatedAsyncioTestCase):
           self.assertEqual(v, e, f"Mismatch at ({r},{c})")
 
 
+class TestCytation7(TestCytation5Backend):
+  """Exercise the shared byte/result fixtures through the C7 public class."""
+
+  backend: Cytation7
+
+  def create_backend(self) -> Cytation7:
+    """Create a C7 with an explicit synthetic FTDI identifier."""
+    return Cytation7(name="cytation7", device_id="test-ftdi-c7")
+
+  async def asyncSetUp(self) -> None:
+    """Fail immediately if reader construction attempts to create a C5 microscope."""
+    microscope_patcher = unittest.mock.patch(
+      "pylabrobot.agilent.biotek.cytation.cytation5.CytationMicroscope",
+      side_effect=AssertionError("C7 plate reading must not construct a C5 microscope"),
+    )
+    microscope_patcher.start()
+    self.addCleanup(microscope_patcher.stop)
+    await super().asyncSetUp()
+
+  async def test_identity_and_setup_warning(self) -> None:
+    """The C7 export selects the requested FTDI device and warns before setup."""
+    self.ftdi.assert_called_once_with(
+      device_id="test-ftdi-c7", human_readable_device_name="Agilent BioTek Cytation 7"
+    )
+    self.assertEqual(self.backend.plate_holder.name, "cytation7_plate_holder")
+    self.backend.io.setup.side_effect = RuntimeError("Synthetic connection failure")
+    with self.assertLogs("pylabrobot.agilent.biotek.cytation.cytation7", level="WARNING") as logs:
+      with self.assertRaisesRegex(RuntimeError, "Synthetic connection failure"):
+        await self.backend.setup()
+    self.assertIn("has not been verified on hardware", logs.output[0])
+    self.assertIn("firmware", logs.output[0])
+
+
 class TestBioTekLoadingTray(unittest.IsolatedAsyncioTestCase):
   """The tray must send the plate geometry to the firmware before closing (tall-plate clearance)."""
 
+  def create_backend(self) -> BioTekPlateReaderDriver:
+    """Create the shared reader under a mocked FTDI constructor."""
+    return BioTekPlateReaderDriver(timeout=0.1)
+
   async def asyncSetUp(self):
     self.manager = unittest.mock.Mock()
-    self.backend = BioTekPlateReaderDriver(timeout=0.1)
+    with unittest.mock.patch("pylabrobot.agilent.biotek.plate_reader_base.FTDI"):
+      self.backend = self.create_backend()
     self.backend.set_slow_mode = unittest.mock.AsyncMock()  # type: ignore[method-assign]
     self.backend.set_plate = unittest.mock.AsyncMock()  # type: ignore[method-assign]
     self.backend.send_command = unittest.mock.AsyncMock()  # type: ignore[method-assign]
@@ -434,3 +581,11 @@ class TestBioTekLoadingTray(unittest.IsolatedAsyncioTestCase):
   async def test_slow_mode_forwarded(self):
     await self.backend.open(slow=True)
     self.backend.set_slow_mode.assert_awaited_once_with(True)
+
+
+class TestCytation7LoadingTray(TestBioTekLoadingTray):
+  """Exercise the existing tray sequencing through the C7 class."""
+
+  def create_backend(self) -> Cytation7:
+    """Create the C7 reader under the shared fixture's transport mock."""
+    return Cytation7(name="cytation7", device_id="test-ftdi-c7")

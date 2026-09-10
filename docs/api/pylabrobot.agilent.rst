@@ -70,6 +70,7 @@ BioTek Cytation
 
     Cytation1
     Cytation5
+    Cytation7
     CytationImagingConfig
 
 

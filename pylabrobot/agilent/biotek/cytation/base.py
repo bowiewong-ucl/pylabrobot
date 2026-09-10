@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class _CytationBase(BioTekPlateReaderDriver, metaclass=abc.ABCMeta):
-  """Shared base for Cytation 1 and Cytation 5 devices.
+  """Shared base for Cytation 1, Cytation 5, and Cytation 7 devices.
 
   Owns the serial connection, the loading tray, and the reads and temperature control
   inherited from the BioTek base. Model-specific hardware (the Cytation 5's camera) is
