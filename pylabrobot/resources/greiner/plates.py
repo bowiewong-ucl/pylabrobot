@@ -120,3 +120,50 @@ def greiner_96_wellplate_200uL_Vb(name: str, with_lid: bool = False) -> Plate:
       name_prefix=name,
     ),
   )
+
+
+# # # # # # # # # # greiner_96_wellplate_392uL_Fb # # # # # # # # # #
+
+
+def greiner_96_wellplate_392uL_Fb(name: str) -> Plate:
+  """Greiner cat. no.: 655096.
+  MICROPLATE, 96 WELL, PS, F-BOTTOM (CHIMNEY WELL), µCLEAR, BLACK, MEDIUM BINDING
+  - Colour: black, clear film bottom
+  - alternative cat. no. (same geometry): 655090 (black, cell culture, lid), 655095 (white),
+    655097 (black, high binding), 655094 (white, high binding), 655098 (white, cell culture, lid)
+  - Material: Polystyrene
+  - Sterilized: No
+  - Total volume = 392 uL, working volume = 25-340 uL
+
+  Dimensions marked "from spec" are taken from Greiner Bio-One's published documents:
+  - Customer drawing "96 Well Microplate, PS, µClear, Chimney Well", revision 3 (2021-09-27):
+    https://shop.gbo.com/en/row/files/33100271/655096.pdf
+  - Product data sheet PDS 65509x, revision 06 (2022-05-30), for volume and film thickness:
+    https://shop.gbo.com/en/row/files/33099186/655096.pdf
+  """
+  return Plate(
+    name=name,
+    size_x=127.76,  # from spec
+    size_y=85.48,  # from spec
+    size_z=14.4,  # from spec
+    lid=None,
+    model=greiner_96_wellplate_392uL_Fb.__name__,
+    ordered_items=create_ordered_items_2d(
+      Well,
+      num_items_x=12,  # from spec
+      num_items_y=8,  # from spec
+      dx=14.38 - 6.96 / 2,  # from spec (A1 center x minus well radius)
+      dy=11.24 - 6.96 / 2,  # from spec (A1 center y minus well radius)
+      dz=14.4 - 10.9,  # from spec (plate height minus well depth)
+      item_dx=9,  # from spec
+      item_dy=9,  # from spec
+      size_x=6.96,  # from spec (top diameter; 6.58 at the bottom)
+      size_y=6.96,  # from spec (top diameter; 6.58 at the bottom)
+      size_z=10.9,  # from spec
+      bottom_type=WellBottomType.FLAT,
+      material_z_thickness=0.19,  # from spec (film bottom, 190 um +- 10%)
+      cross_section_type=CrossSectionType.CIRCLE,
+      max_volume=392,  # from spec
+      name_prefix=name,
+    ),
+  )
