@@ -6,11 +6,20 @@ import math
 import unittest
 import unittest.mock
 from datetime import datetime
-from typing import Iterator
+from typing import Any, Dict, Iterator, List, Tuple, Union
 
 from pylabrobot.agilent.biotek.cytation import Cytation7
-from pylabrobot.agilent.biotek.plate_reader_base import BioTekPlateReaderDriver
-from pylabrobot.resources import CellVis_24_wellplate_3600uL_Fb, CellVis_96_wellplate_350uL_Fb
+from pylabrobot.agilent.biotek.cytation.cytation7 import AbsorbanceStep, FluorescenceStep
+from pylabrobot.agilent.biotek.plate_reader_base import (
+  AbsorbanceResult,
+  BioTekPlateReaderDriver,
+  FluorescenceResult,
+)
+from pylabrobot.resources import (
+  CellVis_24_wellplate_3600uL_Fb,
+  CellVis_96_wellplate_350uL_Fb,
+  Plate,
+)
 
 
 def _byte_iter(s: str) -> Iterator[bytes]:
@@ -20,6 +29,15 @@ def _byte_iter(s: str) -> Iterator[bytes]:
 
 class TestCytation5Backend(unittest.IsolatedAsyncioTestCase):
   """Shared BioTek reader fixtures; these are not C7 hardware captures."""
+
+  # `t` parameter for a 7.5 mm fluorescence read on the 13.83 mm CellVis 96-well plate.
+  fluorescence_height_command = b"621720\x03"
+  # Full-plate 485/528 nm fluorescence read with the reader's default settings.
+  fluorescence_command = (
+    b"0084010101081200012001000011001000001350001002002000485000052800000000000000000021001119\x03"
+  )
+  # Reply the reader sends after `x` aborts a shake; the shared reader does not wait for one.
+  shake_stop_reply = ""
 
   def create_backend(self) -> BioTekPlateReaderDriver:
     """Construct the shared reader under the transport mock installed by setup."""
@@ -122,7 +140,9 @@ class TestCytation5Backend(unittest.IsolatedAsyncioTestCase):
     ):
       with self.subTest(mode=mode):
         self.backend.io.write.reset_mock()
-        self.backend.io.read.side_effect = _byte_iter("\x06\x03\x060000\x03")
+        self.backend.io.read.side_effect = _byte_iter(
+          "\x06\x03\x060000\x03" + self.shake_stop_reply
+        )
         try:
           await asyncio.wait_for(self.backend.shake(mode, frequency=3), timeout=1)
         finally:
@@ -416,12 +436,9 @@ class TestCytation5Backend(unittest.IsolatedAsyncioTestCase):
     )
 
     self.backend.io.write.assert_any_call(b"t")
-    self.backend.io.write.assert_any_call(b"621720\x03")
+    self.backend.io.write.assert_any_call(self.fluorescence_height_command)
     self.backend.io.write.assert_any_call(b"D")
-    self.backend.io.write.assert_any_call(
-      b"0084010101081200012001000011001000001350001002002000485000052800000000000000000021001119"
-      b"\x03"
-    )
+    self.backend.io.write.assert_any_call(self.fluorescence_command)
     self.backend.io.write.assert_any_call(b"O")
 
     expected_data = [
@@ -516,6 +533,15 @@ class TestCytation7(TestCytation5Backend):
 
   backend: Cytation7
 
+  # The C7 positions the optics at plate height plus focal height: 13.83 mm + 7.5 mm.
+  fluorescence_height_command = b"621330\x03"
+  # The C7 layout of the same read: top optics, gain 100, high lamp energy, 10 measurements.
+  fluorescence_command = (
+    b"00790101010812000120010000110010000013500010020020004850000528000000000000021000134\x03"
+  )
+  # Reply the C7 sends once a shake aborted with `x` has stopped.
+  shake_stop_reply = "\x100000\x03"
+
   def create_backend(self) -> Cytation7:
     """Create a C7 with an explicit synthetic FTDI identifier."""
     return Cytation7(name="cytation7", device_id="test-ftdi-c7")
@@ -529,6 +555,12 @@ class TestCytation7(TestCytation5Backend):
     microscope_patcher.start()
     self.addCleanup(microscope_patcher.stop)
     await super().asyncSetUp()
+    clock_patcher = unittest.mock.patch(
+      "pylabrobot.agilent.biotek.cytation.cytation7.datetime",
+      unittest.mock.Mock(now=unittest.mock.Mock(return_value=self.now)),
+    )
+    clock_patcher.start()
+    self.addCleanup(clock_patcher.stop)
 
   async def test_identity_and_setup_warning(self) -> None:
     """The C7 export selects the requested FTDI device and warns before setup."""
@@ -542,6 +574,315 @@ class TestCytation7(TestCytation5Backend):
         await self.backend.setup()
     self.assertIn("has not been verified on hardware", logs.output[0])
     self.assertIn("firmware", logs.output[0])
+
+  async def test_temperature_setting_disabled(self) -> None:
+    """The C7 heats but does not cool, so the shared disabled-setting case does not apply."""
+    self.assertTrue(self.backend.supports_heating)
+    self.assertFalse(self.backend.supports_cooling)
+    self.assertFalse(self.backend.supports_active_cooling)
+    self.assertEqual(self.backend.temperature_range, (None, 45.0))
+
+  async def test_set_temperature_heats(self) -> None:
+    """Heating to 37 °C queries the current temperature, then sends the setpoint."""
+    self.backend.io.read.side_effect = _byte_iter("\x062360000\x03" + "\x06" + "\x03")
+    await self.backend.set_temperature(37)
+    self.assertEqual(
+      self.backend.io.write.await_args_list,
+      [unittest.mock.call(b"h"), unittest.mock.call(b"g"), unittest.mock.call(b"37000")],
+    )
+
+  async def test_set_temperature_rejects_cooling(self) -> None:
+    """A setpoint below the current temperature is rejected before the setpoint is sent."""
+    self.backend.io.read.side_effect = _byte_iter("\x062360000\x03")
+    with self.assertRaisesRegex(ValueError, "Cooling is not supported"):
+      await self.backend.set_temperature(20)
+    self.backend.io.write.assert_awaited_once_with(b"h")
+
+  async def test_set_temperature_with_gradient(self) -> None:
+    """The parameter is the setpoint, then the gradient, each in 0.1 °C."""
+    self.backend.io.read.side_effect = _byte_iter("\x062360000\x03" + "\x06" + "0000\x03")
+    await self.backend.set_temperature(32.5, gradient=0.5)
+    self.backend.io.write.assert_any_call(b"32505")
+
+  def test_checksum_matches_shared_fixtures(self) -> None:
+    """The firmware checksum reproduces every shared fixture command, whatever its type."""
+    fixtures = [
+      "0033010101010100002000000013960030189",
+      "0033010101010100002000000013960130190",
+      "004701010108120001200100001100100000106000080580113",
+      "008401010107010001200100001100100000123000020200200-001000-00300000000000000000001351086",
+      "008401020207030001200100001100100000123000020200200-001000-00300000000000000000001351090",
+      "008401040406040001200100001100100000123000020200200-001000-00300000000000000000001351094",
+      "0084010101081200012001000011001000001350001002002000485000052800000000000000000021001119",
+    ]
+    for command in fixtures:
+      self.assertEqual(self.backend._checksum(command[:-3], "1", 0), command[-3:])
+
+  def test_optics_height_uses_plate_height(self) -> None:
+    """The `t` parameter is the mode digit, then plate height plus focal height, in µm."""
+    plate = Plate(name="plate", size_x=127.76, size_y=85.48, size_z=15.0, ordered_items={})
+    self.assertEqual(self.backend._optics_height(plate, 8, "6"), "623000")
+
+  async def test_abort_waits_for_stop_reply(self) -> None:
+    """Abort consumes the stop reply and warns on a non-zero status."""
+    self.backend.io.read.side_effect = _byte_iter("\x1012AB\x03")
+    with self.assertLogs("pylabrobot.agilent.biotek.cytation.cytation7", level="WARNING") as logs:
+      await self.backend._abort()
+    self.backend.io.write.assert_awaited_once_with(b"x")
+    self.assertIn("12AB", logs.output[0])
+
+  async def test_read_absorbance_uses_firmware_checksum(self) -> None:
+    """A single-well 600 nm read sends checksum 097, where the shared checksum gives 197."""
+    self.backend.io.read.side_effect = _byte_iter(
+      "\x06"
+      + "\x03"
+      + "\x06"
+      + "0350000000000000010000000000490300000\x03"
+      + "\x06"
+      + "0000\x03"
+      + "01,1,\r000:00:00.0,250,01,01,+0.2000\r\n250\x1a000\x1a0000\x03"
+      + "\x062500000\x03"
+    )
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+
+    resp = await self.backend.read_absorbance(plate=plate, wells=plate["A1"], wavelength=600)
+
+    self.backend.io.write.assert_any_call(
+      b"004701010101010001200100001100100000106000080600097\x03"
+    )
+    self.assertEqual(resp[0].data[0][0], 0.2)
+    self.assertEqual(resp[0].temperature, 25.0)
+
+  async def test_read_absorbance_two_wavelengths(self) -> None:
+    """Two wavelengths are two read steps of one command, with a result for each."""
+    self.backend.io.read.side_effect = _byte_iter(
+      "\x06\x03"
+      + "\x06"
+      + "0350000000000000010000000000490300000\x03"
+      + "\x06"
+      + "0000\x03"
+      + "01,1,\r000:00:00.0,250,01,01,+0.3000\r\n250\x1a000"
+      + "\r000:00:01.5,250,01,01,+0.1000\r\n250\x1a000\x1a0000\x03"
+      + "\x062500000\x03"
+    )
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+
+    resp = await self.backend.read_absorbance(plate=plate, wells=plate["A1"], wavelength=[450, 650])
+
+    self.backend.io.write.assert_any_call(
+      b"00580101010101000120010000110010000020600008045006000080650142\x03"
+    )
+    self.assertEqual([r.wavelength for r in resp], [450, 650])
+    self.assertEqual([r.data[0][0] for r in resp], [0.3, 0.1])
+
+  async def test_read_fluorescence_bottom(self) -> None:
+    """A bottom read encodes its settings in the read step and sends no optics height."""
+    self.backend.io.read.side_effect = _byte_iter(
+      "\x06\x03"
+      + "\x06"
+      + "0350000000000000010000000000490300000\x03"
+      + "\x06"
+      + "0000\x03"
+      + "01,1,\r000:00:00.0,250,01,01,0001234\r\n250\x1a000\x1a0000\x03"
+      + "\x062500000\x03"
+    )
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+
+    resp = await self.backend.read_fluorescence(
+      plate=plate,
+      wells=plate["A1"],
+      excitation_wavelength=460,
+      emission_wavelength=515,
+      focal_height=7,
+      optics="bottom",
+      gain=70,
+    )
+
+    self.backend.io.write.assert_any_call(
+      b"00790101010101000120010000110010000013400010020020004600000515000000000000020700119\x03"
+    )
+    self.assertNotIn(unittest.mock.call(b"t"), self.backend.io.write.await_args_list)
+    self.assertEqual(resp[0].data[0][0], 1234.0)
+
+  async def test_read_fluorescence_settings_encoding(self) -> None:
+    """Gain, optics, read speed, measurements, and lamp energy each set their own digits."""
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+    cases: List[Tuple[Dict[str, Any], str]] = [
+      (
+        dict(optics="bottom", gain=40),
+        "00790101010101000120010000110010000013400010020020004600000515000000000000020400116",
+      ),
+      (
+        dict(optics="top", gain=120),
+        "00790101010101000120010000110010000013500010020020004600000515000000000000021200116",
+      ),
+      (
+        dict(optics="top", gain=120, read_speed="sweep"),
+        "00790101010101000120000000110010000013510001020020004600000515000000000000021200116",
+      ),
+      (
+        dict(optics="top", gain=120, measurements_per_data_point=5, lamp_energy="low"),
+        "00790101010101000120010000110010000013500005020020004600000515000000000000001200118",
+      ),
+    ]
+    for settings, command in cases:
+      with self.subTest(**settings):
+        self.backend.io.write.reset_mock()
+        self.backend.io.read.side_effect = _byte_iter(
+          "\x06\x03"
+          + ("\x06\x03" if settings["optics"] == "top" else "")
+          + "\x06"
+          + "0350000000000000010000000000490300000\x03"
+          + "\x06"
+          + "0000\x03"
+          + "01,1,\r000:00:00.0,250,01,01,0000001\r\n250\x1a000\x1a0000\x03"
+          + "\x062500000\x03"
+        )
+        self.backend.clear_plate()
+        await self.backend.read_fluorescence(
+          plate=plate,
+          wells=plate["A1"],
+          excitation_wavelength=460,
+          emission_wavelength=515,
+          focal_height=7,
+          **settings,
+        )
+        self.backend.io.write.assert_any_call(command.encode() + b"\x03")
+
+  async def test_read_fluorescence_sweep_rejects_measurements(self) -> None:
+    """A sweep read takes one measurement per well."""
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+    with self.assertRaisesRegex(ValueError, "sweep"):
+      await self.backend.read_fluorescence(
+        plate=plate,
+        wells=plate["A1"],
+        excitation_wavelength=460,
+        emission_wavelength=515,
+        focal_height=7,
+        read_speed="sweep",
+        measurements_per_data_point=10,
+      )
+    self.backend.io.write.assert_not_called()
+
+  async def test_run_kinetic_streams_reads(self) -> None:
+    """A kinetic run downloads one command; streamed blocks map to cycles and steps."""
+    steps: List[Union[AbsorbanceStep, FluorescenceStep]] = [
+      AbsorbanceStep([450]),
+      FluorescenceStep(460, 515, "top", gain=120),
+    ]
+    self.backend.io.read.side_effect = _byte_iter(
+      "\x06\x03"
+      + "\x06\x03"
+      + "\x06"
+      + "0000\x03"
+      + "\x06"
+      + "0000\x03"
+      + "01,3,S000:00:00.0s02,1,"
+      + "\r000:09:40.0,250,01,01,+0.2100\r\n250\x1a000"
+      + "\r000:09:43.0,250,01,01,0001500\r\n250\x1a000"
+      + "\r000:19:40.0,251,01,01,+0.2110\r\n251\x1a000"
+      + "\r000:19:43.0,251,01,01,0001510\r\n251\x1a000"
+      + "\x1a0000\x03"
+    )
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+
+    reads = [
+      read
+      async for read in self.backend.run_kinetic(
+        plate, plate.get_all_items(), steps, reads=5, interval=600, shake_amplitude=3
+      )
+    ]
+
+    self.backend.io.write.assert_any_call(b"620830\x03")
+    self.backend.io.write.assert_any_call(
+      b"009711010108120001200100002300033110050060020600008045035000100200200046000005150000"
+      b"00000000021200011\x03"
+    )
+    self.assertEqual([(r.cycle, r.step) for r in reads], [(c, s) for c in (0, 1) for s in steps])
+    self.assertEqual([r.elapsed for r in reads[:2]], [580.0, 583.0])
+    self.assertEqual([r.result.data[0][0] for r in reads], [0.21, 1500.0, 0.211, 1510.0])
+    self.assertEqual(reads[2].result.temperature, 25.1)
+
+  async def test_run_kinetic_timed_shake_encoding(self) -> None:
+    """A timed shake, two wavelengths, and 0.1 nm bandwidths encode into the schedule and steps."""
+    self.backend.io.read.side_effect = _byte_iter(
+      "\x06\x03" + "\x06" + "0000\x03" + "\x06" + "0000\x03" + "\x1a0000\x03"
+    )
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+    wells = [plate.get_well(f"{row}{col}") for row in "ABC" for col in range(1, 7)]
+    steps: List[Union[AbsorbanceStep, FluorescenceStep]] = [
+      AbsorbanceStep([405, 450]),
+      FluorescenceStep(530, 590, "bottom", 90, 12.5, 12.5),
+    ]
+
+    async for _ in self.backend.run_kinetic(
+      plate, wells, steps, reads=10, interval=300, shake_amplitude=3, shake_duration=30
+    ):
+      pass
+
+    self.backend.io.write.assert_any_call(
+      b"010811010103060001200100002303033110100030030600008040506000080450340001001251250530"
+      b"0000590000000000000020900063\x03"
+    )
+
+  async def test_run_kinetic_rejects_unencodable_settings(self) -> None:
+    """Shake durations outside 10 s steps and non-rectangular wells are rejected before I/O."""
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+    steps: List[Union[AbsorbanceStep, FluorescenceStep]] = [AbsorbanceStep([600])]
+    for kwargs, wells in (
+      (dict(shake_duration=15), plate["A1"]),
+      ({}, [plate.get_well("A1"), plate.get_well("B2")]),
+    ):
+      with self.subTest(**kwargs):
+        with self.assertRaises(ValueError):
+          async for _ in self.backend.run_kinetic(
+            plate, wells, steps, reads=3, interval=60, **kwargs
+          ):
+            pass
+    self.backend.io.write.assert_not_called()
+
+  async def test_stop_kinetic_waits_for_abort_status(self) -> None:
+    """Aborting a kinetic run waits for the stop reply and reports a non-zero status."""
+    self.backend.io.read.side_effect = _byte_iter("\x1012AB\x03")
+    with self.assertLogs("pylabrobot.agilent.biotek.cytation.cytation7", level="WARNING"):
+      await self.backend.stop_kinetic()
+    self.backend.io.write.assert_awaited_once_with(b"x")
+
+  async def test_resume_kinetic_recovers_reads_taken_while_disconnected(self) -> None:
+    """Reconnecting without reset or commands yields the held reads, then the rest of the run.
+
+    The reads held while disconnected arrive first, without the first block's leading `\\r`;
+    later cycles and the end marker follow.
+    """
+    self.backend.io.read.side_effect = _byte_iter(
+      "000:09:40.0,250,01,01,+0.3000\r\n250\x1a000"
+      "\r000:09:41.5,250,01,01,+0.1000\r\n250\x1a000"
+      "\r000:09:43.0,250,01,01,0001200\r\n250\x1a000"
+      "\r000:14:40.0,250,01,01,+0.3010\r\n250\x1a000"
+      "\r000:14:41.5,250,01,01,+0.1010\r\n250\x1a000"
+      "\r000:14:43.0,250,01,01,0001210\r\n250\x1a000\x1a0000\x03"
+    )
+    plate = CellVis_96_wellplate_350uL_Fb(name="plate")
+    steps: List[Union[AbsorbanceStep, FluorescenceStep]] = [
+      AbsorbanceStep([450, 650]),
+      FluorescenceStep(460, 515, "bottom", gain=70),
+    ]
+
+    reads = [
+      read
+      async for read in self.backend.resume_kinetic(plate, steps, interval=300, reads_received=3)
+    ]
+
+    self.backend.io.usb_reset.assert_not_awaited()
+    self.backend.io.usb_purge_rx_buffer.assert_not_awaited()
+    self.backend.io.write.assert_not_called()
+    self.backend.io.set_baudrate.assert_awaited_once_with(38_461)
+    self.assertEqual([r.cycle for r in reads], [1, 1, 1, 2, 2, 2])
+    self.assertEqual([r.result.data[0][0] for r in reads[:3]], [0.3, 0.1, 1200.0])
+    abs_450, abs_650, fluorescence = (r.result for r in reads[:3])
+    assert isinstance(abs_450, AbsorbanceResult) and isinstance(abs_650, AbsorbanceResult)
+    self.assertEqual([abs_450.wavelength, abs_650.wavelength], [450, 650])
+    self.assertIsInstance(fluorescence, FluorescenceResult)
 
 
 class TestBioTekLoadingTray(unittest.IsolatedAsyncioTestCase):

@@ -380,6 +380,50 @@ class BioTekPlateReaderDriver(metaclass=ABCMeta):
     self._plate = plate
     return resp
 
+  def _checksum(self, payload: str, hundreds_digit: str, offset: int) -> str:
+    """Return the 3-digit checksum appended to a `D` command payload.
+
+    The shared reader sends a fixed hundreds digit for each command type, followed by the byte
+    sum of the payload and that digit, plus a per-command offset, modulo 100. Models verified
+    against their firmware's checksum override this.
+
+    Args:
+      payload: Command text from the 4-digit length through the last parameter digit.
+      hundreds_digit: Hundreds digit the shared reader sends for this command type.
+      offset: Offset the shared reader adds to the byte sum for this command type.
+    """
+    total = sum((payload + hundreds_digit).encode()) + offset
+    return hundreds_digit + str(total % 100).zfill(2)
+
+  def _optics_height(self, plate: Plate, focal_height: float, mode_digit: str) -> str:
+    """Return the `t` command parameter that positions the optics for a read.
+
+    The shared reader sends a mode digit followed by 14.22 mm plus the focal height, in µm,
+    for every plate. Models verified against their firmware override this.
+
+    Args:
+      plate: Plate being read.
+      focal_height: Focal height above the plate, in mm.
+      mode_digit: Read mode digit (`6` for fluorescence, `3` for luminescence).
+    """
+    return f"{mode_digit}{14220 + int(1000 * focal_height)}"
+
+  async def _acquire(self, command: str, timeout: float) -> bytes:
+    """Download an assay with `D`, start it with `O`, and return the result body.
+
+    Args:
+      command: Full `D` parameter, including the checksum and any terminator.
+      timeout: Seconds to wait for the result body after the assay starts.
+    """
+    await self.send_command("D", command)
+
+    resp = await self.send_command("O")
+    assert resp == b"\x060000\x03"
+
+    body = await self._read_until(b"\x03", timeout=timeout)
+    assert body is not None
+    return body
+
   def _get_min_max_row_col_tuples(
     self, wells: List[Well], plate: Plate
   ) -> List[Tuple[int, int, int, int]]:
@@ -413,16 +457,9 @@ class BioTekPlateReaderDriver(metaclass=ABCMeta):
     ]
 
     for min_row, min_col, max_row, max_col in self._get_min_max_row_col_tuples(wells, plate):
-      cmd = f"004701{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}000120010000110010000010600008{wavelength_str}1"
-      checksum = str(sum(cmd.encode()) % 100).zfill(2)
-      cmd = cmd + checksum + "\x03"
-      await self.send_command("D", cmd)
-
-      resp = await self.send_command("O")
-      assert resp == b"\x060000\x03"
-
-      body = await self._read_until(b"\x03", timeout=60 * 3)
-      assert body is not None
+      cmd = f"004701{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}000120010000110010000010600008{wavelength_str}"
+      cmd = cmd + self._checksum(cmd, "1", 0) + "\x03"
+      body = await self._acquire(cmd, timeout=60 * 3)
       parsed_data = self._parse_body(body)
       for r in range(plate.num_items_y):
         for c in range(plate.num_items_x):
@@ -470,7 +507,7 @@ class BioTekPlateReaderDriver(metaclass=ABCMeta):
     )
     await self.set_plate(plate)
 
-    cmd = f"3{14220 + int(1000 * focal_height)}\x03"
+    cmd = self._optics_height(plate, focal_height, "3") + "\x03"
     await self.send_command("t", cmd)
 
     integration_time_seconds = int(integration_time)
@@ -486,17 +523,10 @@ class BioTekPlateReaderDriver(metaclass=ABCMeta):
       [None for _ in range(plate.num_items_x)] for _ in range(plate.num_items_y)
     ]
     for min_row, min_col, max_row, max_col in self._get_min_max_row_col_tuples(wells, plate):
-      cmd = f"008401{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}000120010000110010000012300{integration_time_seconds_s}{integration_time_milliseconds_s}200200-001000-003000000000000000000013510"
-      checksum = str((sum(cmd.encode()) + 8) % 100).zfill(2)
-      cmd = cmd + checksum
-      await self.send_command("D", cmd)
-
-      resp = await self.send_command("O")
-      assert resp == b"\x060000\x03"
-
+      cmd = f"008401{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}000120010000110010000012300{integration_time_seconds_s}{integration_time_milliseconds_s}200200-001000-00300000000000000000001351"
+      cmd = cmd + self._checksum(cmd, "0", 8)
       timeout = 60 + integration_time_seconds * (2 * 60 + 10)
-      body = await self._read_until(b"\x03", timeout=timeout)
-      assert body is not None
+      body = await self._acquire(cmd, timeout=timeout)
       parsed_data = self._parse_body(body)
       for r in range(plate.num_items_y):
         for c in range(plate.num_items_x):
@@ -548,7 +578,7 @@ class BioTekPlateReaderDriver(metaclass=ABCMeta):
     )
     await self.set_plate(plate)
 
-    cmd = f"{614220 + int(1000 * focal_height)}\x03"
+    cmd = self._optics_height(plate, focal_height, "6") + "\x03"
     await self.send_command("t", cmd)
 
     excitation_wavelength_str = str(excitation_wavelength).zfill(4)
@@ -560,17 +590,10 @@ class BioTekPlateReaderDriver(metaclass=ABCMeta):
     for min_row, min_col, max_row, max_col in self._get_min_max_row_col_tuples(wells, plate):
       cmd = (
         f"008401{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}0001200100001100100000135000100200200{excitation_wavelength_str}000"
-        f"{emission_wavelength_str}000000000000000000210011"
+        f"{emission_wavelength_str}00000000000000000021001"
       )
-      checksum = str((sum(cmd.encode()) + 7) % 100).zfill(2)
-      cmd = cmd + checksum + "\x03"
-      await self.send_command("D", cmd)
-
-      resp = await self.send_command("O")
-      assert resp == b"\x060000\x03"
-
-      body = await self._read_until(b"\x03", timeout=60 * 2)
-      assert body is not None
+      cmd = cmd + self._checksum(cmd, "1", 7) + "\x03"
+      body = await self._acquire(cmd, timeout=60 * 2)
       parsed_data = self._parse_body(body)
       for r in range(plate.num_items_y):
         for c in range(plate.num_items_x):
@@ -614,9 +637,8 @@ class BioTekPlateReaderDriver(metaclass=ABCMeta):
       shake_type_bit = str(shake_type.value)
       duration = str(max_duration).zfill(3)
       assert 1 <= frequency <= 6, "Frequency must be between 1 and 6"
-      cmd = f"0033010101010100002000000013{duration}{shake_type_bit}{frequency}01"
-      checksum = str((sum(cmd.encode()) + 73) % 100).zfill(2)
-      cmd = cmd + checksum + "\x03"
+      cmd = f"0033010101010100002000000013{duration}{shake_type_bit}{frequency}0"
+      cmd = cmd + self._checksum(cmd, "1", 73) + "\x03"
       await self.send_command("D", cmd)
 
       resp = await self.send_command("O")

@@ -102,6 +102,7 @@
     "capabilities": [
       "absorbance",
       "fluorescence",
+      "heating",
       "luminescence",
       "shaking"
     ],
@@ -110,7 +111,7 @@
     "api_version": "v1",
     "code_slug": "agilent/biotek/cytation/cytation7",
     "doc_slug": "agilent/cytation7/hello-world",
-    "notes": "Shared reader API; C7 hardware verification pending. No microscopy or temperature setting."
+    "notes": "C7 command layouts for absorbance, fluorescence (top/bottom, gain), heating with gradient, and kinetic runs on the reader, exercised on firmware 1.02; values not yet cross-checked against an independent instrument. Luminescence uses the shared command and is not validated. No microscopy or cooling."
   },
   {
     "id": "biotek-el405",
